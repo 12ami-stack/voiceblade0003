@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ボイス・ブレード・アクション</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans JP', sans-serif;
+            background: #09090b;
+            color: #f4f4f5;
+        }
+        .pixel-font {
+            font-family: 'Press Start 2P', monospace;
+        }
+        canvas {
+            image-rendering: pixelated;
+        }
+    </style>
+</head>
+<body class="flex flex-col items-center justify-center min-h-screen p-4 select-none">
+
+    <div class="text-center mb-3">
+        <h1 class="text-3xl md:text-4xl font-black tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-red-500 via-rose-400 to-amber-500 drop-shadow-[0_2px_10px_rgba(239,68,68,0.5)] pixel-font">
+            VOICE BLADE ACTION
+        </h1>
+        <p class="text-xs md:text-sm text-zinc-400 mt-2 bg-zinc-900/80 px-4 py-1.5 rounded-full border border-zinc-800 inline-block">
+            【操作方法】 A/D・矢印キー:移動 | W/↑:ジャンプ | Space:剣 | <span class="text-sky-400 font-bold">Enterキー:弾発射(Stage2のみ)</span>
+        </p>
+    </div>
+
+    <div id="gameContainer" class="relative shadow-2xl rounded-xl overflow-hidden border-2 border-zinc-700 bg-zinc-950 w-full max-w-[800px] aspect-[2/1]">
+        <canvas id="gameCanvas" width="800" height="400" class="w-full h-full block"></canvas>
+        
+        <!-- Start / Restart Overlay -->
+        <div id="startOverlay" class="absolute inset-0 bg-zinc-950/90 backdrop-blur-sm flex flex-col items-center justify-center cursor-pointer transition-opacity duration-300 z-20">
+            <div class="text-center p-6 max-w-md">
+                <h2 id="overlayTitle" class="text-2xl md:text-3xl font-bold text-red-500 mb-3 pixel-font animate-pulse">VOICE BLADE</h2>
+                <p id="overlaySubtitle" class="text-sm md:text-base text-zinc-300 mb-6 leading-relaxed">
+                    画面をクリックしてゲームを開始してください。<br>
+                    <span class="text-xs text-sky-400 mt-1 block">★2戦目では魔王に対して「Enterキー」で凍結弾が撃てます！</span>
+                    <span class="text-xs text-amber-400 mt-1 block">※ボスが音声でしゃべります（音声合成対応）</span>
+                </p>
+                <button class="bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold px-8 py-3 rounded-xl shadow-lg shadow-red-900/40 transform hover:scale-105 transition active:scale-95 pixel-font text-xs">
+                    GAME START
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+        const startOverlay = document.getElementById("startOverlay");
+        const overlayTitle = document.getElementById("overlayTitle");
+        const overlaySubtitle = document.getElementById("overlaySubtitle");
+
+        let gameActive = false;
+        let gameState = "start"; // "start", "playing", "gameover", "clear"
+        let currentStage = 1;
+        let globalTimer = 0;
+
+        // Player bullets array
+        let playerBullets = [];
+
+        // Speech synthesis helper (GC対策としてインスタンスを外側で保持)
+        let currentUtterance = null;
+        function speak(text) {
+            if (!window.speechSynthesis) return;
+            try {
+                window.speechSynthesis.cancel();
+                currentUtterance = new SpeechSynthesisUtterance(text);
+                currentUtterance.lang = 'ja-JP';
+                currentUtterance.volume = 0.9;
+                currentUtterance.rate = 1.15;
+                currentUtterance.pitch = currentStage === 1 ? 0.8 : 0.6;
+                window.speechSynthesis.speak(currentUtterance);
+                
+                enemy.subtitle = text;
+                // 発話の文字数や設定レートに合わせて表示時間を動的に延長（途切れ防止）
+                enemy.subtitleTimer = Math.max(120, text.length * 20);
+            } catch (e) {
+                console.log("Speech error:", e);
+            }
+        }
+
+        // Game entities
+        const groundY = 320; // Ground line
+        const player = {
+            x: 100, y: groundY - 60, width: 40, height: 60,
+            vx: 0, vy: 0, speed: 4.5, jumpPower: -13, gravity: 0.6,
+            isGrounded: true, hp: 100, maxHp: 100,
+            isAttacking: false, attackTimer: 0, attackCooldown: 0, 
+            shootCooldown: 0, direction: 1
+        };
+
+        let enemy = {
+            x: 600, y: groundY - 60, width: 40, height: 60,
+            speed: 2, hp: 150, maxHp: 150,
+            isAttacking: false, attackTimer: 0, attackCooldown: 0,
+            freezeTimer: 0,
+            state: "idle", subtitle: "", subtitleTimer: 0, name: "BOSS: 門番"
+        };
+
+        // Input tracking
+        const keys = {};
+        window.addEventListener("keydown", e => {
+            if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter"].includes(e.code)) {
+                e.preventDefault();
+            }
+            keys[e.code] = true;
+        });
+        window.addEventListener("keyup", e => keys[e.code] = false);
+
+        // Stage initialization
+        function initStage(stage) {
+            currentStage = stage;
+            player.x = 100;
+            player.y = groundY - player.height;
+            player.vy = 0;
+            player.isGrounded = true;
+            player.hp = player.maxHp;
+            playerBullets = [];
+
+            if (stage === 1) {
+                enemy = {
+                    x: 620, y: groundY - 60, width: 44, height: 64,
+                    speed: 2.2, hp: 150, maxHp: 150,
+                    isAttacking: false, attackTimer: 0, attackCooldown: 0,
+                    freezeTimer: 0,
+                    state: "idle", subtitle: "", subtitleTimer: 0, name: "BOSS: 門番"
+                };
+                speak("ふん、心あたたまる味わいだと？");
+            } else {
+                enemy = {
+                    x: 620, y: groundY - 76, width: 54, height: 76,
+                    speed: 3.2, hp: 250, maxHp: 250,
+                    isAttacking: false, attackTimer: 0, attackCooldown: 0,
+                    freezeTimer: 0,
+                    state: "idle", subtitle: "", subtitleTimer: 0, name: "FINAL BOSS: 魔王"
+                };
+                speak("なんとエッチな天狗でござるか！");
+            }
+        }
+
+        // Start / Restart trigger
+        startOverlay.addEventListener("click", () => {
+            if (gameState === "playing") return;
+            if (gameState === "gameover" || gameState === "clear" || gameState === "start") {
+                initStage(1);
+            }
+            startOverlay.style.opacity = "0";
+            setTimeout(() => {
+                startOverlay.style.display = "none";
+            }, 300);
+            gameActive = true;
+            gameState = "playing";
+            requestAnimationFrame(gameLoop);
+        });
+
+        function triggerGameOver() {
+            gameActive = false;
+            gameState = "gameover";
+            speak("あふんあふん！やらしいわねえ！");
+            overlayTitle.textContent = "GAME OVER";
+            overlayTitle.className = "text-2xl md:text-3xl font-bold text-red-500 mb-3 pixel-font";
+            overlaySubtitle.textContent = "クリックしてもう一度挑戦する";
+            startOverlay.style.display = "flex";
+            setTimeout(() => startOverlay.style.opacity = "1", 10);
+        }
+
+        function triggerStageClear() {
+            gameActive = false;
+            gameState = "clear";
+            speak("その者、青き衣をまといてこんじきの野に降り立つべし。失われし大地との絆を結び、ついに人々を青き清浄の地へ導かん！");
+            overlayTitle.textContent = "ALL STAGE CLEAR!!";
+            overlayTitle.className = "text-2xl md:text-3xl font-bold text-amber-400 mb-3 pixel-font animate-bounce";
+            overlaySubtitle.textContent = "おめでとうございます！クリックして再挑戦";
+            startOverlay.style.display = "flex";
+            setTimeout(() => startOverlay.style.opacity = "1", 10);
+        }
+
+        // Main game loop
+        function gameLoop() {
+            if (!gameActive) return;
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Update game logic
+        function update() {
+            globalTimer++;
+            if (player.attackCooldown > 0) player.attackCooldown--;
+            if (player.shootCooldown > 0) player.shootCooldown--;
+            if (enemy.attackCooldown > 0) enemy.attackCooldown--;
+            if (enemy.subtitleTimer > 0) enemy.subtitleTimer--;
+
+            if (enemy.freezeTimer > 0) {
+                enemy.freezeTimer--;
+            }
+
+            // Player controls & physics
+            if (player.hp > 0 && enemy.hp > 0) {
+                if (keys["KeyA"] || keys["ArrowLeft"]) {
+                    player.x -= player.speed;
+                    player.direction = -1;
+                }
+                if (keys["KeyD"] || keys["ArrowRight"]) {
+                    player.x += player.speed;
+                    player.direction = 1;
+                }
+                if ((keys["KeyW"] || keys["ArrowUp"]) && player.isGrounded) {
+                    player.vy = player.jumpPower;
+                    player.isGrounded = false;
+                }
+
+                player.vy += player.gravity;
+                player.y += player.vy;
+
+                if (player.y >= groundY - player.height) {
+                    player.y = groundY - player.height;
+                    player.vy = 0;
+                    player.isGrounded = true;
+                }
+
+                player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+
+                if ((keys["Space"] || keys["KeyJ"]) && !player.isAttacking && player.attackCooldown === 0) {
+                    player.isAttacking = true;
+                    player.attackTimer = 16;
+                    player.attackCooldown = 24;
+                }
+
+                if (currentStage === 2 && keys["Enter"] && player.shootCooldown === 0) {
+                    playerBullets.push({
+                        x: player.direction === 1 ? player.x + player.width : player.x - 16,
+                        y: player.y + player.height / 2 - 6,
+                        width: 16,
+                        height: 12,
+                        vx: player.direction * 8
+                    });
+                    player.shootCooldown = 30;
+                }
+            }
+
+            for (let i = playerBullets.length - 1; i >= 0; i--) {
+                let b = playerBullets[i];
+                b.x += b.vx;
+
+                if (b.x < 0 || b.x > canvas.width) {
+                    playerBullets.splice(i, 1);
+                    continue;
+                }
+
+                if (enemy.hp > 0 &&
+                    b.x < enemy.x + enemy.width && b.x + b.width > enemy.x &&
+                    b.y < enemy.y + enemy.height && b.y + b.height > enemy.y) {
+                    
+                    enemy.hp = Math.max(0, enemy.hp - 15);
+                    enemy.freezeTimer = 120;
+                    playerBullets.splice(i, 1);
+                }
+            }
+
+            if (player.isAttacking) {
+                player.attackTimer--;
+                if (player.attackTimer === 8) {
+                    checkPlayerAttack();
+                }
+                if (player.attackTimer <= 0) {
+                    player.isAttacking = false;
+                }
+            }
+
+            if (enemy.hp > 0 && player.hp > 0) {
+                if (enemy.freezeTimer === 0) {
+                    let dist = Math.abs((enemy.x + enemy.width/2) - (player.x + player.width/2));
+                    
+                    if (enemy.state === "idle" || enemy.state === "chase") {
+                        if (enemy.x > player.x + 18) {
+                            enemy.x -= enemy.speed;
+                        } else if (enemy.x < player.x - 18) {
+                            enemy.x += enemy.speed;
+                        }
+                        enemy.state = "chase";
+
+                        let triggerDist = currentStage === 1 ? 75 : 100;
+                        if (dist < triggerDist && enemy.attackCooldown === 0) {
+                            enemy.state = "attack";
+                            enemy.isAttacking = true;
+                            enemy.attackTimer = currentStage === 1 ? 22 : 16;
+                            enemy.attackCooldown = currentStage === 1 ? 85 : 55;
+                            speak(currentStage === 1 ? 
+                                ["足どけい！", "居間から消え去れい！", "わしが村長じゃい"][Math.floor(Math.random() * 3)] : 
+                                ["よう来たのうおぬし？", "せんべいやろう！", "まて逃がさぬぞ！"][Math.floor(Math.random() * 3)]
+                            );
+                        }
+                    }
+                }
+            }
+
+            if (enemy.isAttacking && enemy.freezeTimer === 0) {
+                enemy.attackTimer--;
+                if (enemy.attackTimer === 10) {
+                    checkEnemyAttack();
+                }
+                if (enemy.attackTimer <= 0) {
+                    enemy.isAttacking = false;
+                    enemy.state = "idle";
+                }
+            } else if (enemy.freezeTimer > 0) {
+                enemy.isAttacking = false;
+            }
+
+            if (enemy.hp <= 0 && enemy.state !== "dead") {
+                enemy.state = "dead";
+                if (currentStage === 1) {
+                    speak("おっと！これはまだ食べられる！お前にはやらん");
+                    gameActive = false;
+                    setTimeout(() => {
+                        initStage(2);
+                        gameActive = true;
+                        requestAnimationFrame(gameLoop);
+                    }, 2200);
+                } else {
+                    setTimeout(() => {
+                        triggerStageClear();
+                    }, 1500);
+                }
+            }
+
+            if (player.hp <= 0 && gameActive) {
+                triggerGameOver();
+            }
+        }
+
+        function checkPlayerAttack() {
+            let reach = 50;
+            let atkX = player.direction === 1 ? player.x + player.width : player.x - reach;
+            let atkW = reach;
+            let atkY = player.y;
+            let atkH = player.height;
+
+            if (atkX < enemy.x + enemy.width && atkX + atkW > enemy.x &&
+                atkY < enemy.y + enemy.height && atkY + atkH > enemy.y && enemy.hp > 0) {
+                
+                let damage = 25;
+                enemy.hp = Math.max(0, enemy.hp - damage);
+
+                if (enemy.hp > 0) {
+                    speak(currentStage === 1 ? 
+                        ["えっ？", "効かない！", "とうッ！"][Math.floor(Math.random() * 3)] : 
+                        ["ほざきな！", "ぬるいわい", "ぬしゃあその程度じゃけえのう！"][Math.floor(Math.random() * 3)]
+                    );
+                }
+            }
+        }
+
+        function checkEnemyAttack() {
+            let range = currentStage === 1 ? 45 : 75;
+            let eAtkBoxX = player.x < enemy.x ? enemy.x - range : enemy.x + enemy.width;
+            let eAtkBoxW = range;
+
+            if (player.x < eAtkBoxX + eAtkBoxW && player.x + player.width > eAtkBoxX &&
+                player.y < enemy.y + enemy.height && player.y + player.height > enemy.y && player.hp > 0) {
+                
+                let damage = currentStage === 1 ? 20 : 30;
+                player.hp = Math.max(0, player.hp - damage);
+
+                if (player.hp > 0 && Math.random() < 0.5) {
+                    speak(currentStage === 1 ? "なんと！もう終わりでござるか！" : "貧乏暇なしでござるな！");
+                }
+            }
+        }
+
+        function draw() {
+            let bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+            bgGrad.addColorStop(0, currentStage === 1 ? "#0f172a" : "#1e1b4b");
+            bgGrad.addColorStop(1, currentStage === 1 ? "#1e293b" : "#31103a");
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.fillStyle = "rgba(255, 255, 255, 0.15)";
+            for (let i = 0; i < 5; i++) {
+                ctx.fillRect((globalTimer * (i + 1) * 0.5 + i * 150) % canvas.width, (i * 40) % 200, 2, 2);
+            }
+
+            ctx.fillStyle = "#09090b";
+            ctx.fillRect(0, groundY, canvas.width, canvas.height - groundY);
+            ctx.fillStyle = currentStage === 1 ? "#3b82f6" : "#ec4899";
+            ctx.fillRect(0, groundY, canvas.width, 4);
+
+            ctx.fillStyle = "#38bdf8";
+            playerBullets.forEach(b => {
+                ctx.fillRect(b.x, b.y, b.width, b.height);
+                ctx.fillStyle = "#bae6fd";
+                ctx.fillRect(b.x + 2, b.y + 2, b.width - 4, b.height - 4);
+                ctx.fillStyle = "#38bdf8";
+            });
+
+            if (player.hp > 0) {
+                ctx.fillStyle = "#38bdf8";
+                ctx.fillRect(player.x, player.y, player.width, player.height);
+                ctx.fillStyle = "#ffffff";
+                ctx.fillRect(player.direction === 1 ? player.x + 24 : player.x + 8, player.y + 12, 8, 4);
+                
+                if (player.isAttacking) {
+                    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+                    let slashX = player.direction === 1 ? player.x + player.width : player.x - 50;
+                    ctx.fillRect(slashX, player.y + 10, 50, 36);
+                    ctx.fillStyle = "#38bdf8";
+                    ctx.fillRect(slashX + (player.direction === 1 ? 10 : 30), player.y + 16, 20, 24);
+                }
+            }
+
+            if (enemy.hp > 0) {
+                if (enemy.freezeTimer > 0) {
+                    ctx.fillStyle = (Math.floor(globalTimer / 6) % 2 === 0) ? "#93c5fd" : "#38bdf8";
+                } else {
+                    ctx.fillStyle = enemy.isAttacking ? "#ef4444" : (currentStage === 1 ? "#a855f7" : "#4f46e5");
+                }
+                
+                ctx.fillRect(enemy.x, enemy.y, enemy.width, enemy.height);
+                
+                ctx.fillStyle = enemy.freezeTimer > 0 ? "#1e3a8a" : "#facc15";
+                ctx.fillRect(player.x < enemy.x ? enemy.x + 10 : enemy.x + enemy.width - 18, enemy.y + 14, 8, 6);
+
+                if (enemy.isAttacking && enemy.freezeTimer === 0) {
+                    ctx.fillStyle = currentStage === 1 ? "rgba(239, 68, 68, 0.35)" : "rgba(217, 70, 239, 0.4)";
+                    let range = currentStage === 1 ? 45 : 75;
+                    let auraX = player.x < enemy.x ? enemy.x - range : enemy.x + enemy.width;
+                    ctx.fillRect(auraX, enemy.y + 5, range, enemy.height - 10);
+                }
+
+                if (enemy.freezeTimer > 0) {
+                    ctx.strokeStyle = "#e0f2fe";
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(enemy.x - 3, enemy.y - 3, enemy.width + 6, enemy.height + 6);
+                }
+            }
+
+            ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+            ctx.fillRect(20, 20, 210, 26);
+            ctx.strokeStyle = "#3f3f46";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(20, 20, 210, 26);
+            ctx.fillStyle = "#22c55e";
+            ctx.fillRect(23, 23, Math.max(0, (player.hp / player.maxHp) * 204), 20);
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "bold 11px 'Noto Sans JP', sans-serif";
+            ctx.fillText(`PLAYER: ${player.hp}/${player.maxHp}`, 32, 37);
+
+            ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+            ctx.fillRect(canvas.width - 230, 20, 210, 26);
+            ctx.strokeRect(canvas.width - 230, 20, 210, 26);
+            ctx.fillStyle = enemy.freezeTimer > 0 ? "#38bdf8" : "#ef4444";
+            let enemyHpWidth = Math.max(0, (enemy.hp / enemy.maxHp) * 204);
+            ctx.fillRect(canvas.width - 230 + 204 - enemyHpWidth + 3, 23, enemyHpWidth, 20);
+            ctx.fillStyle = "#ffffff";
+            ctx.fillText(`${enemy.name}${enemy.freezeTimer > 0 ? " [氷結]" : ""}`, canvas.width - 220, 37);
+
+            ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
+            ctx.font = "bold 16px 'Press Start 2P', monospace";
+            ctx.textAlign = "center";
+            ctx.fillText(`STAGE ${currentStage}`, canvas.width / 2, 38);
+            ctx.textAlign = "left";
+
+            if (enemy.subtitleTimer > 0 && enemy.subtitle) {
+                ctx.save();
+                ctx.font = "bold 16px 'Noto Sans JP', sans-serif";
+                ctx.textAlign = "center";
+                
+                let textStr = `${enemy.name.split(": ")[1]}：「${enemy.subtitle}」`;
+                let textW = ctx.measureText(textStr).width;
+                
+                ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+                ctx.fillRect(canvas.width / 2 - textW / 2 - 15, 75, textW + 30, 36);
+                ctx.strokeStyle = "#000000";
+                ctx.lineWidth = 3;
+                ctx.strokeText(textStr, canvas.width / 2, 98);
+                
+                ctx.fillStyle = currentStage === 1 ? "#fca5a5" : "#f0abfc";
+                ctx.fillText(textStr, canvas.width / 2, 98);
+                ctx.restore();
+            }
+        }
+    </script>
+</body>
+</html>
